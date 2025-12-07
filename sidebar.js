@@ -1,5 +1,7 @@
 // Sidebar logic for IP Connection Analysis
 // This file contains all logic for the sidebar UI and its event handlers
+import { getFlowColors, getInvalidLabels, getInvalidReason, getFlowColor } from './legends.js';
+import { MAX_FLOW_LIST_ITEMS, FLOW_LIST_RENDER_BATCH } from './config.js';
 
 export function initSidebar(options) {
     // options: { onResetView, ... }
@@ -99,16 +101,277 @@ export function filterFlowList(searchTerm) {
     });
 }
 
+// Progress UI for flow processing/list rendering
+export function showFlowProgress(label = 'Working…', percent = 0) {
+    const box = document.getElementById('flowProgress');
+    const bar = document.getElementById('flowProgressBar');
+    const lbl = document.getElementById('flowProgressLabel');
+    if (!box || !bar || !lbl) return;
+    box.style.display = 'block';
+    lbl.textContent = label;
+    const pct = Math.max(0, Math.min(1, Number(percent) || 0));
+    bar.style.width = `${Math.round(pct * 100)}%`;
+}
+
+export function updateFlowProgress(percent, label) {
+    const bar = document.getElementById('flowProgressBar');
+    if (!bar) return;
+    if (label) {
+        const lbl = document.getElementById('flowProgressLabel');
+        if (lbl) lbl.textContent = label;
+    }
+    const pct = Math.max(0, Math.min(1, Number(percent) || 0));
+    bar.style.width = `${Math.round(pct * 100)}%`;
+}
+
+export function hideFlowProgress() {
+    const box = document.getElementById('flowProgress');
+    if (!box) return;
+    box.style.display = 'none';
+}
+
+// CSV loading progress UI
+export function showCsvProgress(label = 'Loading CSV file...', percent = 0) {
+    const box = document.getElementById('csvProgress');
+    const bar = document.getElementById('csvProgressBar');
+    const lbl = document.getElementById('csvProgressLabel');
+    if (!box || !bar || !lbl) return;
+    box.style.display = 'block';
+    lbl.textContent = label;
+    const pct = Math.max(0, Math.min(1, Number(percent) || 0));
+    bar.style.width = `${Math.round(pct * 100)}%`;
+}
+
+export function updateCsvProgress(percent, label) {
+    const bar = document.getElementById('csvProgressBar');
+    if (!bar) return;
+    if (label) {
+        const lbl = document.getElementById('csvProgressLabel');
+        if (lbl) lbl.textContent = label;
+    }
+    const pct = Math.max(0, Math.min(1, Number(percent) || 0));
+    bar.style.width = `${Math.round(pct * 100)}%`;
+}
+
+export function hideCsvProgress() {
+    const box = document.getElementById('csvProgress');
+    if (!box) return;
+    box.style.display = 'none';
+}
+
+// Paginated flow list rendering
+export function createFlowListCapped(flows, selectedFlowIds, formatBytes, formatTimestamp, exportFlowToCSV, zoomToFlow, updateTcpFlowPacketsGlobal, flowColors = {}) {
+    const container = document.getElementById('flowListModalList') || document.getElementById('flowList');
+    if (!container) return;
+    if (!flows || flows.length === 0) {
+        container.innerHTML = '<div style="color:#666; text-align:center; padding:20px;">No flows to display</div>';
+        return;
+    }
+
+    // Sort flows
+    const sorted = [...flows].sort((a, b) => a.startTime - b.startTime);
+    const total = sorted.length;
+    const flowsPerPage = MAX_FLOW_LIST_ITEMS || 500;
+    const totalPages = Math.ceil(total / flowsPerPage);
+
+    // Store pagination state on container
+    if (!container._paginationState) {
+        container._paginationState = {
+            currentPage: 1,
+            totalPages: totalPages,
+            flows: sorted,
+            flowsPerPage: flowsPerPage
+        };
+    } else {
+        // Update state with new flows
+        container._paginationState.flows = sorted;
+        container._paginationState.totalPages = totalPages;
+        container._paginationState.flowsPerPage = flowsPerPage;
+        // Reset to page 1 if current page is beyond new total
+        if (container._paginationState.currentPage > totalPages) {
+            container._paginationState.currentPage = 1;
+        }
+    }
+
+    const state = container._paginationState;
+    const startIndex = (state.currentPage - 1) * flowsPerPage;
+    const endIndex = Math.min(startIndex + flowsPerPage, total);
+    const currentPageFlows = sorted.slice(startIndex, endIndex);
+
+    // Clear container and create pagination UI
+    container.innerHTML = '';
+    
+    // Create pagination header
+    const paginationHeader = document.createElement('div');
+    paginationHeader.style.cssText = 'display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; padding:8px; background:#f8f9fa; border-radius:4px; font-size:12px;';
+    
+    const pageInfo = document.createElement('div');
+    pageInfo.style.cssText = 'color:#555;';
+    pageInfo.innerHTML = `Page ${state.currentPage} of ${totalPages} • Showing ${(startIndex + 1).toLocaleString()}-${endIndex.toLocaleString()} of ${total.toLocaleString()} flows`;
+    
+    const paginationControls = document.createElement('div');
+    paginationControls.style.cssText = 'display:flex; gap:8px; align-items:center;';
+    
+    // Previous button
+    const prevBtn = document.createElement('button');
+    prevBtn.textContent = '← Previous';
+    prevBtn.disabled = state.currentPage === 1;
+    prevBtn.style.cssText = 'padding:4px 8px; border:1px solid #ced4da; border-radius:3px; background:#fff; cursor:pointer; font-size:11px;';
+    if (prevBtn.disabled) prevBtn.style.opacity = '0.5';
+    
+    // Page selector
+    const pageSelect = document.createElement('select');
+    pageSelect.style.cssText = 'padding:4px; border:1px solid #ced4da; border-radius:3px; font-size:11px;';
+    for (let i = 1; i <= totalPages; i++) {
+        const option = document.createElement('option');
+        option.value = i;
+        option.textContent = i;
+        if (i === state.currentPage) option.selected = true;
+        pageSelect.appendChild(option);
+    }
+    
+    // Next button
+    const nextBtn = document.createElement('button');
+    nextBtn.textContent = 'Next →';
+    nextBtn.disabled = state.currentPage === totalPages;
+    nextBtn.style.cssText = 'padding:4px 8px; border:1px solid #ced4da; border-radius:3px; background:#fff; cursor:pointer; font-size:11px;';
+    if (nextBtn.disabled) nextBtn.style.opacity = '0.5';
+    
+    // Event handlers
+    const renderPage = (page) => {
+        state.currentPage = page;
+        createFlowListCapped(flows, selectedFlowIds, formatBytes, formatTimestamp, exportFlowToCSV, zoomToFlow, updateTcpFlowPacketsGlobal, flowColors);
+    };
+    
+    prevBtn.addEventListener('click', () => {
+        if (state.currentPage > 1) renderPage(state.currentPage - 1);
+    });
+    
+    nextBtn.addEventListener('click', () => {
+        if (state.currentPage < totalPages) renderPage(state.currentPage + 1);
+    });
+    
+    pageSelect.addEventListener('change', (e) => {
+        renderPage(parseInt(e.target.value));
+    });
+    
+    paginationControls.appendChild(prevBtn);
+    paginationControls.appendChild(pageSelect);
+    paginationControls.appendChild(nextBtn);
+    
+    paginationHeader.appendChild(pageInfo);
+    paginationHeader.appendChild(paginationControls);
+    container.appendChild(paginationHeader);
+
+    const invalidLabels = getInvalidLabels();
+
+    // Render current page flows
+    const BATCH = Math.max(50, Number(FLOW_LIST_RENDER_BATCH) || 200);
+    const shouldShowProgress = currentPageFlows.length >= BATCH * 2;
+    if (shouldShowProgress) {
+        showFlowProgress('Rendering flow list…', 0);
+    }
+
+    let index = 0;
+    function renderBatch() {
+        const end = Math.min(currentPageFlows.length, index + BATCH);
+        for (let i = index; i < end; i++) {
+            const flow = currentPageFlows[i];
+            const duration = Math.max(0, Math.round((flow.endTime - flow.startTime) / 1000000));
+            const { utcTime: startTime } = formatTimestamp(flow.startTime);
+            const { utcTime: endTime } = formatTimestamp(flow.endTime);
+            const reason = getInvalidReason(flow);
+            const color = getFlowColor(flow, flowColors);
+
+            let closeTypeText = '';
+            if (reason) {
+                const label = invalidLabels[reason] || 'Invalid';
+                closeTypeText = `
+                    <span style="display:inline-flex; align-items:center; gap:6px;">
+                        <span style=\"display:inline-block; width:10px; height:10px; border-radius:2px; background:${color}; border:1px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,0.08);\"></span>
+                        <span style=\"color:#333;\">${label}</span>
+                    </span>`;
+            } else if (flow.closeType === 'graceful' || flow.closeType === 'abortive') {
+                const label = flow.closeType === 'graceful' ? 'Graceful close' : 'Abortive close';
+                closeTypeText = `
+                    <span style="display:inline-flex; align-items:center; gap:6px;">
+                        <span style=\"display:inline-block; width:10px; height:10px; border-radius:2px; background:${color}; border:1px solid #fff; box-shadow:0 0 0 1px rgba(0,0,0,0.08);\"></span>
+                        <span style=\"color:#333;\">${label}</span>
+                    </span>`;
+            } else if (flow.establishmentComplete) {
+                closeTypeText = '• Still open';
+            } else {
+                closeTypeText = '• Incomplete';
+            }
+
+            const item = document.createElement('div');
+            item.className = 'flow-item';
+            item.dataset.flowId = String(flow.id);
+            item.style.borderLeft = `4px solid ${color}`;
+            item.innerHTML = `
+                <input type=\"checkbox\" class=\"flow-checkbox\" id=\"flow-${flow.id}\" ${selectedFlowIds.has(String(flow.id)) ? 'checked' : ''}>
+                <div class=\"flow-info\">
+                    <div class=\"flow-connection\">${flow.initiator}:${flow.initiatorPort} ↔ ${flow.responder}:${flow.responderPort}</div>
+                    <div class=\"flow-details\">
+                        <span class=\"flow-status ${flow.state}\">${String(flow.state || '').replace('_',' ')}</span>
+                        <span>${flow.totalPackets} packets</span>
+                        <span>${formatBytes(flow.totalBytes)}</span>
+                        <span>${duration}s duration</span>
+                        <span>${closeTypeText}</span>
+                        <button class=\"flow-zoom-btn\" data-flow-id=\"${flow.id}\" title=\"Zoom timeline to this flow\">🔍 Zoom</button>
+                        <button class=\"flow-export-btn\" data-flow-id=\"${flow.id}\" style=\"margin-left:auto; padding:2px 6px; font-size:10px; border:1px solid #ced4da; border-radius:3px; background:#fff; cursor:pointer;\">Export CSV</button>
+                    </div>
+                    <div style=\"font-size:10px; color:#999; margin-top:3px;\">Start: ${startTime} • End: ${endTime}</div>
+                </div>`;
+
+            const cb = item.querySelector('.flow-checkbox');
+            cb.addEventListener('change', (e) => {
+                const flowId = String(flow.id);
+                if (cb.checked) { selectedFlowIds.add(flowId); item.classList.add('selected'); }
+                else { selectedFlowIds.delete(flowId); item.classList.remove('selected'); }
+                if (typeof updateTcpFlowPacketsGlobal === 'function') updateTcpFlowPacketsGlobal();
+            });
+            item.addEventListener('click', (e) => {
+                if (e.target && e.target.type !== 'checkbox') cb.click();
+            });
+            const zoomBtn = item.querySelector('.flow-zoom-btn');
+            zoomBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (typeof zoomToFlow === 'function') zoomToFlow(flow);
+            });
+            const exportBtn = item.querySelector('.flow-export-btn');
+            exportBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (typeof exportFlowToCSV === 'function') exportFlowToCSV(flow);
+            });
+
+            if (selectedFlowIds.has(String(flow.id))) item.classList.add('selected');
+            container.appendChild(item);
+        }
+
+        index = end;
+        if (shouldShowProgress) {
+            updateFlowProgress(end / currentPageFlows.length);
+        }
+        if (index < currentPageFlows.length) {
+            requestAnimationFrame(renderBatch);
+        } else if (shouldShowProgress) {
+            hideFlowProgress();
+        }
+    }
+
+    requestAnimationFrame(renderBatch);
+
+    // If rendering in modal, update header count
+    const countEl = document.getElementById('flowListModalCount');
+    if (countEl) countEl.textContent = `${total.toLocaleString()} flow(s)`;
+}
+
 export function wireSidebarControls(opts) {
     const on = (id, type, handler) => { const el = document.getElementById(id); if (el && handler) el.addEventListener(type, handler); };
     on('ipSearch', 'input', (e) => { if (opts.onIpSearch) opts.onIpSearch(e.target.value); });
     on('selectAllIPs', 'click', () => { if (opts.onSelectAllIPs) opts.onSelectAllIPs(); });
     on('clearAllIPs', 'click', () => { if (opts.onClearAllIPs) opts.onClearAllIPs(); });
-
-    on('flowSearch', 'input', (e) => { if (opts.onFlowSearch) opts.onFlowSearch(e.target.value); });
-    on('selectAllFlows', 'click', () => { if (opts.onSelectAllFlows) opts.onSelectAllFlows(); });
-    on('clearAllFlows', 'click', () => { if (opts.onClearAllFlows) opts.onClearAllFlows(); });
-    on('selectEstablishedFlows', 'click', () => { if (opts.onSelectEstablishedFlows) opts.onSelectEstablishedFlows(); });
 
     on('showTcpFlows', 'change', (e) => { if (opts.onToggleShowTcpFlows) opts.onToggleShowTcpFlows(e.target.checked); });
     on('showEstablishment', 'change', (e) => { if (opts.onToggleEstablishment) opts.onToggleEstablishment(e.target.checked); });
@@ -116,6 +379,18 @@ export function wireSidebarControls(opts) {
     on('showClosing', 'change', (e) => { if (opts.onToggleClosing) opts.onToggleClosing(e.target.checked); });
     on('showGroundTruth', 'change', (e) => { if (opts.onToggleGroundTruth) opts.onToggleGroundTruth(e.target.checked); });
     on('toggleBinning', 'change', (e) => { if (opts.onToggleBinning) opts.onToggleBinning(e.target.checked); });
+
+    // Render mode radios
+    const modeCircles = document.getElementById('renderModeCircles');
+    const modeBars = document.getElementById('renderModeBars');
+    if (modeCircles && modeBars && opts.onToggleRenderMode) {
+        const handler = () => {
+            const mode = modeBars.checked ? 'bars' : 'circles';
+            opts.onToggleRenderMode(mode);
+        };
+        modeCircles.addEventListener('change', handler);
+        modeBars.addEventListener('change', handler);
+    }
 }
 
 export function updateFlagStats(packets, classifyFlags, flagColors) {
@@ -197,7 +472,7 @@ export function updateIPStats(packets, flagColors, formatBytes) {
 }
 
 export function createFlowList(flows, selectedFlowIds, formatBytes, formatTimestamp, exportFlowToCSV, zoomToFlow, updateTcpFlowPacketsGlobal, flowColors = {}) {
-    const container = document.getElementById('flowList');
+    const container = document.getElementById('flowListModalList') || document.getElementById('flowList');
     if (!container) return;
     if (!flows || flows.length === 0) {
         container.innerHTML = '<div style="color:#666; text-align:center; padding:20px;">No flows to display</div>';
@@ -205,41 +480,16 @@ export function createFlowList(flows, selectedFlowIds, formatBytes, formatTimest
     }
     const sorted = [...flows].sort((a,b)=>a.startTime - b.startTime);
 
-    const closeColors = {
-        graceful: (flowColors.closing && flowColors.closing.graceful) || '#8e44ad',
-        abortive: (flowColors.closing && flowColors.closing.abortive) || '#c0392b'
-    };
-    const invalidLabels = {
-        'invalid_ack': 'Invalid ACK',
-        'rst_during_handshake': 'RST during handshake',
-        'incomplete_no_synack': 'Incomplete (no SYN+ACK)',
-        'incomplete_no_ack': 'Incomplete (no ACK)',
-        'invalid_synack': 'Invalid SYN+ACK',
-        'unknown_invalid': 'Invalid (unspecified)'
-    };
-    const getInvalidReason = (f) => {
-        if (!f) return null;
-        let r = f.invalidReason;
-        if (!r && (f.closeType === 'invalid' || f.state === 'invalid')) r = 'unknown_invalid';
-        return r || null;
-    };
-    const getFlowColor = (f) => {
-        const reason = getInvalidReason(f);
-        if (reason) {
-            return (flowColors.invalid && flowColors.invalid[reason]) || '#6c757d';
-        }
-        if (f && (f.closeType === 'graceful' || f.closeType === 'abortive')) {
-            return closeColors[f.closeType] || '#6c757d';
-        }
-        return '#adb5bd'; // neutral grey for unknown/ongoing
-    };
+    // Use flow legend helpers from legends.js
+    const closeColors = getFlowColors(flowColors);
+    const invalidLabels = getInvalidLabels();
     let html = '';
     sorted.forEach(flow => {
         const duration = Math.round((flow.endTime - flow.startTime) / 1000000);
         const { utcTime: startTime } = formatTimestamp(flow.startTime);
         const { utcTime: endTime } = formatTimestamp(flow.endTime);
         const reason = getInvalidReason(flow);
-        const color = getFlowColor(flow);
+        const color = getFlowColor(flow, flowColors);
         let closeTypeText = '';
         if (reason) {
             const label = invalidLabels[reason] || 'Invalid';
@@ -299,9 +549,97 @@ export function createFlowList(flows, selectedFlowIds, formatBytes, formatTimest
         if (typeof updateTcpFlowPacketsGlobal === 'function') updateTcpFlowPacketsGlobal();
     }));
     container.querySelectorAll('.flow-item').forEach(item => item.addEventListener('click', (e) => {
-        if (e.target.type !== 'checkbox') item.querySelector('.flow-checkbox').click();
+        if (e.target && e.target.type !== 'checkbox') {
+            const cb = item.querySelector('.flow-checkbox');
+            if (cb) cb.click();
+        }
     }));
     selectedFlowIds.forEach(id => { const el = container.querySelector(`[data-flow-id="${id}"]`); if (el) el.classList.add('selected'); });
+
+    // If rendering in modal, update header count
+    const countEl = document.getElementById('flowListModalCount');
+    if (countEl) countEl.textContent = `${flows.length.toLocaleString()} flow(s)`;
+}
+
+// Modal helpers for the Flow List popup
+export function showFlowListModal() {
+    const overlay = document.getElementById('flowListModalOverlay');
+    if (!overlay) return;
+    overlay.style.display = 'flex';
+    // Center modal on first open or keep previous position if moved
+    try {
+        const modal = document.getElementById('flowListModal');
+        if (!modal) return;
+        const hasPosition = modal.dataset.positioned === 'true';
+        if (!hasPosition) {
+            // Center within viewport
+            const vw = window.innerWidth, vh = window.innerHeight;
+            const rect = modal.getBoundingClientRect();
+            const left = Math.max(8, (vw - rect.width) / 2);
+            const top = Math.max(8, (vh - rect.height) / 2);
+            modal.style.left = `${left}px`;
+            modal.style.top = `${top}px`;
+            modal.dataset.positioned = 'true';
+        }
+    } catch (_) {}
+}
+
+export function hideFlowListModal() {
+    const overlay = document.getElementById('flowListModalOverlay');
+    if (overlay) overlay.style.display = 'none';
+}
+
+let flowListModalWired = false;
+export function wireFlowListModalControls({ onSelectAll, onClearAll, onSearch } = {}) {
+    if (flowListModalWired) return;
+    flowListModalWired = true;
+    const overlay = document.getElementById('flowListModalOverlay');
+    const closeBtn = document.getElementById('flowListModalClose');
+    const selectAllBtn = document.getElementById('flowListModalSelectAll');
+    const clearAllBtn = document.getElementById('flowListModalClearAll');
+    const searchInput = document.getElementById('flowListModalSearch');
+    const modal = document.getElementById('flowListModal');
+    const header = modal ? modal.querySelector('.modal-header') : null;
+
+    // Overlay is non-blocking and click-through; close via button only
+    if (closeBtn) closeBtn.addEventListener('click', hideFlowListModal);
+    if (selectAllBtn && typeof onSelectAll === 'function') selectAllBtn.addEventListener('click', onSelectAll);
+    if (clearAllBtn && typeof onClearAll === 'function') clearAllBtn.addEventListener('click', onClearAll);
+    if (searchInput && typeof onSearch === 'function') searchInput.addEventListener('input', (e) => onSearch(e.target.value));
+
+    // Draggable modal via header
+    if (modal && header) {
+        let isDragging = false;
+        let startX = 0, startY = 0, origLeft = 0, origTop = 0;
+        const onMouseMove = (e) => {
+            if (!isDragging) return;
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+            const newLeft = Math.max(8, Math.min(window.innerWidth - modal.offsetWidth - 8, origLeft + dx));
+            const newTop = Math.max(8, Math.min(window.innerHeight - modal.offsetHeight - 8, origTop + dy));
+            modal.style.left = `${newLeft}px`;
+            modal.style.top = `${newTop}px`;
+            modal.dataset.positioned = 'true';
+        };
+        const onMouseUp = () => {
+            if (!isDragging) return;
+            isDragging = false;
+            document.removeEventListener('mousemove', onMouseMove);
+            document.removeEventListener('mouseup', onMouseUp);
+        };
+        header.addEventListener('mousedown', (e) => {
+            // Only start dragging with primary button
+            if (e.button !== 0) return;
+            isDragging = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            const rect = modal.getBoundingClientRect();
+            origLeft = rect.left;
+            origTop = rect.top;
+            document.addEventListener('mousemove', onMouseMove);
+            document.addEventListener('mouseup', onMouseUp);
+        });
+    }
 }
 
 export function updateTcpFlowStats(flows, selectedFlowIds, formatBytes) {
@@ -362,14 +700,4 @@ export function updateGroundTruthStatsUI(html, ok=true) {
     if (!container) return;
     container.innerHTML = html;
     container.style.color = ok ? '#27ae60' : '#e74c3c';
-}
-
-export function renderInvalidLegend(panelEl, legendItemsHtml, totalText) {
-    if (!panelEl) return;
-    panelEl.innerHTML = `<div style="font-weight:600; margin-bottom:6px;">${totalText}</div>${legendItemsHtml}`;
-}
-
-export function renderClosingLegend(panelEl, legendItemsHtml, totalText) {
-    if (!panelEl) return;
-    panelEl.innerHTML = `<div style="font-weight:600; margin-bottom:6px;">${totalText}</div>${legendItemsHtml}`;
 }

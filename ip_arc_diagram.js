@@ -1,7 +1,7 @@
 // Extracted from ip_arc_diagram_3.html inline script
 // This file contains all logic for the IP Connection Analysis visualization
-import { initSidebar, createIPCheckboxes as sbCreateIPCheckboxes, filterIPList as sbFilterIPList, filterFlowList as sbFilterFlowList, updateFlagStats as sbUpdateFlagStats, updateIPStats as sbUpdateIPStats, createFlowList as sbCreateFlowList, updateTcpFlowStats as sbUpdateTcpFlowStats, updateGroundTruthStatsUI as sbUpdateGroundTruthStatsUI, wireSidebarControls as sbWireSidebarControls } from './sidebar.js';
-import { renderInvalidLegend as sbRenderInvalidLegend, renderClosingLegend as sbRenderClosingLegend } from './legends.js';
+import { initSidebar, createIPCheckboxes as sbCreateIPCheckboxes, filterIPList as sbFilterIPList, filterFlowList as sbFilterFlowList, updateFlagStats as sbUpdateFlagStats, updateIPStats as sbUpdateIPStats, createFlowList as sbCreateFlowList, updateTcpFlowStats as sbUpdateTcpFlowStats, updateGroundTruthStatsUI as sbUpdateGroundTruthStatsUI, wireSidebarControls as sbWireSidebarControls, showCsvProgress as sbShowCsvProgress, updateCsvProgress as sbUpdateCsvProgress, hideCsvProgress as sbHideCsvProgress } from './sidebar.js';
+import { renderInvalidLegend as sbRenderInvalidLegend, renderClosingLegend as sbRenderClosingLegend, drawFlagLegend as drawFlagLegendFromModule } from './legends.js';
 import { initOverview, createOverviewChart, updateBrushFromZoom, updateOverviewInvalidVisibility, setBrushUpdating } from './overview_chart.js';
 import { GLOBAL_BIN_COUNT } from './config.js';
 
@@ -76,6 +76,15 @@ function applyVisibilityToDots(mask) {
 let fullData = [];
 let filteredData = [];
 let svg, mainGroup, width, height, xScale, yScale, zoom;
+// Bottom overlay (fixed area above overview) for main x-axis and legends
+let bottomOverlaySvg = null;
+let bottomOverlayRoot = null;
+let bottomOverlayAxisGroup = null;
+let bottomOverlayDurationLabel = null;
+let bottomOverlayWidth = 0;
+let bottomOverlayHeight = 140; // generous to fit axis + legends; mirrors CSS negative margin
+let chartMarginLeft = 150;
+let chartMarginRight = 120;
 // Layers for performance tuning: persistent full-domain layer and dynamic zoom layer
 let fullDomainLayer = null;
 let dynamicLayer = null;
@@ -91,8 +100,8 @@ let pairs = new Map(); // Global pairs map for IP pairing system
 let ipPositions = new Map(); // Global IP positions map
 let ipOrder = []; // Current vertical order of IPs
 // Row layout constants (used for positioning and drag-reorder)
-const ROW_GAP = 80; // vertical gap between IP rows
-const TOP_PAD = 60; // top padding before first row
+const ROW_GAP = 50; // vertical gap between IP rows
+const TOP_PAD = 30; // slight top buffer to avoid clipping
 let tcpFlows = []; // Store detected TCP flows (from CSV)
 let currentFlows = []; // Flows matching current IP selection (subset of tcpFlows)
 let selectedFlowIds = new Set(); // Store IDs of selected flows as strings
@@ -122,11 +131,14 @@ let globalMaxBinCount = 1;
 let useBinning = true;
 
 // Draw a circle-size legend (bottom-right) for smallest/middle/largest counts
-function drawSizeLegend() {
+function drawSizeLegend(targetSvgOverride = null, targetWidth = null, targetHeight = null, axisY = null) {
     try {
-        if (!svg || !width || !height) return;
+        const targetSvg = targetSvgOverride || svg;
+        const w = (typeof targetWidth === 'number') ? targetWidth : width;
+        const h = (typeof targetHeight === 'number') ? targetHeight : height;
+        if (!targetSvg || !w || !h) return;
         // Remove previous legend if any
-        svg.select('.size-legend').remove();
+        targetSvg.select('.size-legend').remove();
 
         const maxCount = Math.max(1, globalMaxBinCount);
         const midCount = Math.max(1, Math.round(maxCount / 2));
@@ -142,10 +154,11 @@ function drawSizeLegend() {
         const legendWidth = maxR * 2 + padding * 2; // compact width
         const legendHeight = 2 * maxR + padding + (padding + labelGap); // space for title + labels
 
-        const legendX = Math.max(0, width - legendWidth - 12);
-        const legendY = Math.max(0, height - legendHeight - 12);
+    const anchorY = (typeof axisY === 'number') ? axisY : h;
+    const legendX = Math.max(0, w - legendWidth - 12);
+    const legendY = Math.max(0, (anchorY - legendHeight - 8));
 
-        const g = svg.append('g').attr('class', 'size-legend').attr('transform', `translate(${legendX},${legendY})`);
+    const g = targetSvg.append('g').attr('class', 'size-legend').attr('transform', `translate(${legendX},${legendY})`);
 
         // Background
         g.append('rect')
@@ -200,127 +213,24 @@ function drawSizeLegend() {
     } catch (_) { /* ignore legend draw errors */ }
 }
 
-// Compact flags legend placed next to the size legend (bottom-right)
+// Wrapper function for the extracted flag legend
 function drawFlagLegend() {
-    try {
-        if (!svg || !width || !height) return;
-        svg.select('.flag-legend').remove();
-
-        // Recompute size-legend box to align horizontally
-        const maxCount = Math.max(1, globalMaxBinCount);
-        const rScale = d3.scaleSqrt().domain([1, maxCount]).range([RADIUS_MIN, RADIUS_MAX]);
-        const maxR = Math.max(rScale(maxCount), RADIUS_MIN);
-        const padding = 8;
-        const labelGap = 32;
-        const sizeLegendWidth = maxR * 2 + padding * 2;
-        const sizeLegendHeight = 2 * maxR + padding + (padding + labelGap);
-        const sizeLegendX = Math.max(0, width - sizeLegendWidth - 12);
-        const sizeLegendY = Math.max(0, height - sizeLegendHeight - 12);
-
-        // Build items from flagColors keys; order to follow typical TCP flow
-        // Handshake -> Data -> Closing -> Resets; keep OTHER last
-        const allKeys = Object.keys(flagColors || {});
-        const preferredOrder = ['SYN', 'SYN+ACK', 'ACK', 'PSH+ACK', 'FIN', 'FIN+ACK', 'ACK+RST', 'RST'];
-        let items;
-        if (allKeys.length) {
-            const std = preferredOrder.filter(k => allKeys.includes(k));
-            const extras = allKeys.filter(k => !preferredOrder.includes(k) && k !== 'OTHER').sort((a,b)=>a.localeCompare(b));
-            items = [...std, ...extras];
-            if (allKeys.includes('OTHER')) items.push('OTHER');
-        } else {
-            items = ['SYN','SYN+ACK','ACK','PSH+ACK','FIN','FIN+ACK','ACK+RST','RST','OTHER'];
-        }
-
-        const sw = 10;       // swatch size
-        const rowH = 16;     // row height for readability
-        const innerPad = 6;
-        const colGap = 16;   // space between columns
-        const textLeft = 14; // text x offset from swatch
-        const titleH = 14;   // title line height
-        const maxRowsPerCol = 6;
-
-        // Split items into columns with up to maxRowsPerCol rows each
-        const cols = Math.max(1, Math.ceil(items.length / maxRowsPerCol));
-        const columns = Array.from({ length: cols }, (_, ci) => items.slice(ci * maxRowsPerCol, (ci + 1) * maxRowsPerCol));
-
-        // Measure text widths using a temporary DOM element
-        const measure = (txt) => {
-            try {
-                const el = document.createElement('span');
-                el.textContent = txt;
-                el.style.position = 'absolute';
-                el.style.visibility = 'hidden';
-                el.style.whiteSpace = 'nowrap';
-                el.style.font = '10px sans-serif';
-                document.body.appendChild(el);
-                const w = el.getBoundingClientRect().width;
-                document.body.removeChild(el);
-                return Math.ceil(w);
-            } catch (_) { return txt.length * 6; }
-        };
-        const colTextWidths = columns.map(col => (col.length ? Math.max(...col.map(measure)) : 0));
-        const colWidths = colTextWidths.map(w => sw + textLeft + w);
-        const rows = Math.max(...columns.map(c => c.length), 0);
-
-        const fWidth = innerPad * 2 + (colWidths.length ? colWidths.reduce((a,b)=>a+b,0) : 0) + colGap * Math.max(0, cols - 1);
-        const fHeight = innerPad * 2 + titleH + rows * rowH;
-
-        const legendX = Math.max(0, sizeLegendX - 12 - fWidth);
-        const legendY = Math.max(0, height - fHeight - 12);
-
-        const g = svg.append('g').attr('class', 'flag-legend').attr('transform', `translate(${legendX},${legendY})`);
-
-        // Background
-        g.append('rect')
-            .attr('x', 0)
-            .attr('y', 0)
-            .attr('rx', 6)
-            .attr('ry', 6)
-            .attr('width', fWidth)
-            .attr('height', fHeight)
-            .style('fill', '#fff')
-            .style('opacity', 0.85)
-            .style('stroke', '#ccc');
-
-        // Title
-        g.append('text')
-            .attr('x', fWidth / 2)
-            .attr('y', 12)
-            .attr('text-anchor', 'middle')
-            .style('font-size', '11px')
-            .style('font-weight', '600')
-            .style('fill', '#333')
-            .text('Flags');
-
-        const innerTop = titleH + innerPad;
-        // Render columns left to right
-        let xOffset = innerPad;
-        columns.forEach((col, ci) => {
-            const colW = colWidths[ci] || (sw + textLeft + 24);
-            col.forEach((flag, ri) => {
-                const y = innerTop + ri * rowH;
-                const color = flagColors[flag] || flagColors.OTHER || '#bdc3c7';
-                const x = xOffset;
-                g.append('rect')
-                    .attr('x', x)
-                    .attr('y', y - sw + 6)
-                    .attr('width', sw)
-                    .attr('height', sw)
-                    .attr('rx', 2)
-                    .attr('ry', 2)
-                    .style('fill', color)
-                    .style('stroke', '#fff')
-                    .style('shape-rendering', 'crispEdges');
-                g.append('text')
-                    .attr('x', x + textLeft)
-                    .attr('y', y + 4)
-                    .style('font-size', '10px')
-                    .style('fill', '#333')
-                    .text(flag);
-            });
-            xOffset += colW + colGap;
-        });
-    } catch (_) { /* ignore legend draw errors */ }
+    // Default to bottom overlay if available; fallback to main svg
+    const targetSvg = bottomOverlayRoot || svg;
+    const w = bottomOverlayRoot ? width : width;
+    const h = bottomOverlayRoot ? bottomOverlayHeight : height;
+    const axisBaseY = bottomOverlayRoot ? Math.max(20, bottomOverlayHeight - 20) : (height - 12);
+    drawFlagLegendFromModule({ 
+        svg: targetSvg, 
+        width: w, 
+        height: h, 
+        flagColors, 
+        globalMaxBinCount, 
+        RADIUS_MIN, 
+        RADIUS_MAX, 
+        d3,
+        axisY: axisBaseY
+    });
 }
 
 // Global line path generator function updated to draw curved arcs
@@ -487,9 +397,8 @@ function isFlagVisibleByPhase(flagType) {
     return true;
 }
 
-document.getElementById('dataFile').addEventListener('change', handleFileLoad);
-// Sidebar initialization and Reset View button logic
-window.addEventListener('DOMContentLoaded', () => {
+// Initialization function for the arc diagram module
+function initializeArcVisualization() {
     // Initialize overview module with references
     initOverview({
         d3,
@@ -499,6 +408,7 @@ window.addEventListener('DOMContentLoaded', () => {
         getCurrentFlows: () => currentFlows,
         getSelectedFlowIds: () => selectedFlowIds,
         updateTcpFlowPacketsGlobal: () => updateTcpFlowPacketsGlobal(),
+        createFlowList: (flows) => createFlowList(flows),
         sbRenderInvalidLegend: (panel, html, title) => sbRenderInvalidLegend(panel, html, title),
         sbRenderClosingLegend: (panel, html, title) => sbRenderClosingLegend(panel, html, title),
         makeConnectionKey: (a,b,c,d) => makeConnectionKey(a,b,c,d),
@@ -546,12 +456,232 @@ window.addEventListener('DOMContentLoaded', () => {
         onToggleDataTransfer: (checked) => { showDataTransfer = checked; drawSelectedFlowArcs(); try { applyInvalidReasonFilter(); } catch(_) {} },
         onToggleClosing: (checked) => { showClosing = checked; drawSelectedFlowArcs(); try { applyInvalidReasonFilter(); } catch(_) {} },
         onToggleGroundTruth: (checked) => { showGroundTruth = checked; const selectedIPs = Array.from(document.querySelectorAll('#ipCheckboxes input[type="checkbox"]:checked')).map(cb => cb.value); drawGroundTruthBoxes(selectedIPs); },
-        onToggleBinning: (checked) => { useBinning = checked; isHardResetInProgress = true; applyZoomDomain(xScale.domain(), 'program'); setTimeout(()=>{ try { const selIPs = Array.from(document.querySelectorAll('#ipCheckboxes input[type="checkbox"]:checked')).map(cb => cb.value); drawGroundTruthBoxes(selIPs); } catch(_){} }, 0); }
+        onToggleBinning: (checked) => { 
+            useBinning = checked; 
+            isHardResetInProgress = true; 
+            
+            // Force immediate re-render of the visualization
+            try {
+                // Re-render the main visualization with current filtered data
+                visualizeTimeArcs(filteredData);
+                
+                // Update TCP flow packets and arcs
+                updateTcpFlowPacketsGlobal();
+                
+                // Redraw selected flow arcs with new binning
+                drawSelectedFlowArcs();
+                
+                // Apply any active filters
+                applyInvalidReasonFilter();
+                
+                // Update legends to reflect new scaling
+                setTimeout(() => {
+                    try { 
+                        try {
+                            const axisBaseY = Math.max(20, bottomOverlayHeight - 20);
+                            drawSizeLegend(bottomOverlayRoot, width, bottomOverlayHeight, axisBaseY);
+                        } catch {}
+                        drawFlagLegend();
+                        const selIPs = Array.from(document.querySelectorAll('#ipCheckboxes input[type="checkbox"]:checked')).map(cb => cb.value); 
+                        drawGroundTruthBoxes(selIPs); 
+                    } catch(_) {}
+                }, 50);
+            } catch (e) {
+                console.warn('Error updating visualization after binning toggle:', e);
+                // Fallback to original behavior
+                applyZoomDomain(xScale.domain(), 'program');
+            }
+        }
     });
-});
 
-// Load ground truth data in the background
-loadGroundTruthData();
+    // Window resize handler for responsive visualization
+    setupWindowResizeHandler();
+}
+
+// Window resize handler for responsive visualization
+function setupWindowResizeHandler() {
+    let resizeTimeout;
+    
+    const handleResize = () => {
+        // Clear existing timeout to debounce rapid resize events
+        clearTimeout(resizeTimeout);
+        
+        resizeTimeout = setTimeout(() => {
+            try {
+                // Only proceed if we have data and existing visualization
+                if (!fullData || fullData.length === 0 || !svg || !xScale || !yScale) {
+                    return;
+                }
+                
+                LOG('Handling window resize, updating visualization dimensions');
+                
+                // Store old dimensions for comparison
+                const oldWidth = width;
+                const oldHeight = height;
+                
+                const container = d3.select("#chart-container").node();
+                if (!container) return;
+                
+                // Calculate new dimensions
+                const containerRect = container.getBoundingClientRect();
+                const newWidth = Math.max(400, containerRect.width - chartMarginLeft - chartMarginRight);
+                const newHeight = Math.max(300, containerRect.height - 100); // Leave space for controls
+                
+                // Update global dimensions
+                width = newWidth;
+                height = newHeight;
+                
+                LOG(`Resize: ${oldWidth}x${oldHeight} -> ${width}x${height}`);
+                
+                // Resize main SVG; extend by overlay height so rows continue beneath legends
+                svg.attr('width', width + chartMarginLeft + chartMarginRight)
+                   .attr('height', height + bottomOverlayHeight);
+                
+                // Update scales with new width
+                if (xScale && timeExtent) {
+                    xScale.range([0, width]);
+                }
+                
+                // Update bottom overlay dimensions
+                bottomOverlayWidth = Math.max(0, newWidth + chartMarginLeft + chartMarginRight);
+                d3.select('#chart-bottom-overlay-svg')
+                    .attr('width', bottomOverlayWidth)
+                    .attr('height', bottomOverlayHeight);
+                
+                if (bottomOverlayRoot) {
+                    bottomOverlayRoot.attr('transform', `translate(${chartMarginLeft},0)`);
+                }
+                
+                // Update main chart axis and legends
+                if (bottomOverlayAxisGroup && xScale) {
+                    const axis = d3.axisBottom(xScale).tickFormat(d => {
+                        const timestampInt = Math.floor(d);
+                        const date = new Date(timestampInt / 1000);
+                        return date.toISOString().split('T')[1].split('.')[0];
+                    });
+                    bottomOverlayAxisGroup.call(axis);
+                    
+                    // Redraw legends with new dimensions
+                    const axisBaseY = Math.max(20, bottomOverlayHeight - 20);
+                    if (bottomOverlayDurationLabel) {
+                        bottomOverlayDurationLabel.attr('y', axisBaseY - 12);
+                    }
+                    
+                    try { 
+                        drawSizeLegend(bottomOverlayRoot, newWidth, bottomOverlayHeight, axisBaseY); 
+                    } catch (e) { 
+                        LOG('Error redrawing size legend:', e); 
+                    }
+                    
+                    try { 
+                        drawFlagLegend(); 
+                    } catch (e) { 
+                        LOG('Error redrawing flag legend:', e); 
+                    }
+                }
+                
+                // Update zoom behavior with new dimensions
+                if (zoom && zoomTarget) {
+                    const currentTransform = d3.zoomTransform(zoomTarget.node());
+                    zoom.extent([[0, 0], [width, height]])
+                        .scaleExtent([1, Math.max(20, width / 50)]);
+                    
+                    // Clear the cache to force fresh calculations
+                    fullDomainBinsCache = { version: -1, data: [], binSize: null, sorted: false };
+                    
+                    // Also increment data version to invalidate other caches
+                    dataVersion++;
+                    
+                    // Clear cached selections to force fresh rendering
+                    dotsSelection = null;
+                    
+                    // Trigger the zoom event handler to redraw everything with new scale
+                    // We need to dispatch a zoom event to trigger the redraw
+                    const event = new CustomEvent('zoom');
+                    event.transform = currentTransform;
+                    event.sourceEvent = { type: 'resize' };
+                    
+                    // Get the zoom handler function and call it
+                    const zoomHandler = zoom.on('zoom');
+                    if (typeof zoomHandler === 'function') {
+                        try {
+                            LOG('Calling zoom handler to redraw with new dimensions');
+                            zoomHandler.call(zoomTarget.node(), event);
+                            LOG('Zoom handler called successfully');
+                        } catch (e) {
+                            LOG('Error calling zoom handler directly:', e);
+                            // Fallback: manually trigger zoom transform
+                            zoomTarget.call(zoom.transform, currentTransform);
+                        }
+                    } else {
+                        LOG('Zoom handler not found, using fallback');
+                        // Fallback: manually trigger zoom transform
+                        zoomTarget.call(zoom.transform, currentTransform);
+                    }
+                }
+                
+                // Recreate overview chart with new dimensions
+                if (timeExtent && timeExtent.length === 2) {
+                    try {
+                        createOverviewChart(fullData, {
+                            timeExtent: timeExtent,
+                            width: width,
+                            margins: { left: chartMarginLeft, right: chartMarginRight, top: 80, bottom: 50 }
+                        });
+                        
+                        // Restore brush selection to current zoom domain if available
+                        if (xScale && updateBrushFromZoom) {
+                            updateBrushFromZoom();
+                        }
+                    } catch (e) {
+                        LOG('Error recreating overview chart on resize:', e);
+                    }
+                }
+                
+                // The zoom handler will take care of redrawing dots and arcs
+                // Just need to update any additional elements that aren't handled by zoom
+                
+                // Update clip path with new dimensions
+                if (svg) {
+                    svg.select('#clip rect')
+                        .attr('width', width + 40) // DOT_RADIUS equivalent
+                        .attr('height', height + 80); // allow some overflow; overlay sits above
+                }
+                
+                // Update global domain for overview sync
+                try { 
+                    window.__arc_x_domain__ = xScale.domain(); 
+                } catch {}
+                
+                LOG('Window resize handling complete - zoom handler will redraw visualization');
+                
+                LOG('Window resize handling complete');
+                
+            } catch (e) {
+                console.warn('Error during window resize:', e);
+            }
+        }, 150); // 150ms debounce delay
+    };
+    
+    // Add resize event listener
+    window.addEventListener('resize', handleResize);
+    
+    // Also handle zoom events from browser (Ctrl+/Ctrl-)
+    window.addEventListener('wheel', (event) => {
+        if (event.ctrlKey || event.metaKey) {
+            // Browser zoom detected, trigger resize after a short delay
+            setTimeout(handleResize, 100);
+        }
+    }, { passive: true });
+    
+    // Handle browser zoom via keyboard shortcuts
+    document.addEventListener('keydown', (event) => {
+        if ((event.ctrlKey || event.metaKey) && (event.key === '+' || event.key === '-' || event.key === '0')) {
+            // Browser zoom shortcut detected
+            setTimeout(handleResize, 100);
+        }
+    });
+}
 
 // Function to convert UTC datetime string to epoch microseconds
 function utcToEpochMicroseconds(utcString) {
@@ -900,9 +1030,15 @@ function redrawSelectedFlowsView() {
                     const packet = d.originalPackets ? d.originalPackets[0] : d;
                     const arcPath = arcPathGenerator(packet);
                     if (arcPath) {
+                        const count = d && d.count ? d.count : 1;
+                        const thickness = d3.scaleLinear()
+                            .domain([1, Math.max(1, globalMaxBinCount)])
+                            .range([0.5, 8])
+                            .clamp(true)(Math.max(1, count));
                         mainGroup.append('path').attr('class', 'hover-arc').attr('d', arcPath)
                             .style('stroke', flagColors[d.binned ? d.flagType : classifyFlags(d.flags)] || flagColors.OTHER)
-                            .style('stroke-width', '2px').style('stroke-opacity', 0.8).style('fill', 'none').style('pointer-events', 'none');
+                            .style('stroke-width', `${thickness}px`)
+                            .style('stroke-opacity', 0.8).style('fill', 'none').style('pointer-events', 'none');
                     }
                     tooltip.style('display', 'block').html(createTooltipHTML(d));
                 })
@@ -999,23 +1135,88 @@ function drawSelectedFlowArcs() {
 
     // Only draw lines for packets in the visible time range
     const [t0, t1] = xScale.domain();
-
-    filteredData.forEach(p => {
+    
+    // Get visible packets for selected flows
+    let visiblePackets = filteredData.filter(p => {
         const ts = Math.floor(p.timestamp);
-        if (ts < t0 || ts > t1) return;
+        if (ts < t0 || ts > t1) return false;
         const key = makeConnectionKey(p.src_ip, p.src_port, p.dst_ip, p.dst_port);
-        if (!selectedKeys.has(key)) return;
+        return selectedKeys.has(key);
+    });
 
-        const ftype = classifyFlags(p.flags);
+    // Decide effective time bucketing for arcs (mirror binning heuristics)
+    const zoomLevel = calculateZoomLevel(xScale, timeExtent);
+    const currentDomain = xScale.domain();
+    const relevantTimeRange = Math.max(1, currentDomain[1] - currentDomain[0]);
+    const binSizeCandidate = getBinSize(zoomLevel, relevantTimeRange);
+    const microsPerPixel = Math.max(1, Math.floor(relevantTimeRange / Math.max(1, (typeof width === 'number' ? width : 1))));
+    const ARC_BIN_COUNT = (typeof GLOBAL_BIN_COUNT === 'number') ? GLOBAL_BIN_COUNT : (GLOBAL_BIN_COUNT.ARCS || GLOBAL_BIN_COUNT.BAR || 300);
+    const estBins = Math.max(1, Math.min(ARC_BIN_COUNT, Math.floor(typeof width === 'number' ? width : ARC_BIN_COUNT)));
+    const expectedPktsPerBin = visiblePackets.length / estBins;
+    const doBinning = (binSizeCandidate !== 0) && (binSizeCandidate > microsPerPixel) && (expectedPktsPerBin >= 1.15);
+
+    // Group packets by time bucket + src/dst pair + flagType to get per-arc counts
+    const arcGroups = new Map();
+    for (const packet of visiblePackets) {
+        const timestamp = Math.floor(packet.timestamp);
+        const timeBucket = doBinning ? Math.floor(timestamp / binSizeCandidate) * binSizeCandidate : timestamp;
+        const flagType = classifyFlags(packet.flags);
+        const key = `${timeBucket}|${packet.src_ip}|${packet.src_port || 0}|${packet.dst_ip}|${packet.dst_port || 0}|${flagType}`;
+        let g = arcGroups.get(key);
+        if (!g) {
+            g = {
+                timestamp: timeBucket,
+                src_ip: packet.src_ip,
+                dst_ip: packet.dst_ip,
+                src_port: packet.src_port || 0,
+                dst_port: packet.dst_port || 0,
+                flags: packet.flags,
+                flagType,
+                count: 0,
+                originalPackets: [],
+                rep: packet
+            };
+            arcGroups.set(key, g);
+        }
+        g.count++;
+        g.originalPackets.push(packet);
+    }
+
+    const groups = Array.from(arcGroups.values());
+
+    // Build a bin-count map from the same binning used for dots, so widths match the circle legend
+        const ARC_STROKE_WIDTH = 2;
+        const countMap = new Map();
+        groups.forEach(g => {
+            const key = `${g.timestamp}_${g.src_ip}_${g.src_port}_${g.dst_ip}_${g.dst_port}_${g.flagType}`;
+            countMap.set(key, g.count);
+        });
+
+    // Build a global linear scale from 1 to globalMaxBinCount (matches circle legend)
+    const MIN_THICKNESS = 0.5;
+    const MAX_THICKNESS = 8;
+    const thicknessScale = d3.scaleLinear()
+        .domain([1, Math.max(1, globalMaxBinCount)])
+        .range([MIN_THICKNESS, MAX_THICKNESS])
+        .clamp(true);
+
+    groups.forEach(g => {
+        const ftype = g.flagType;
         if (!isFlagVisibleByPhase(ftype)) return;
-        const path = arcPathGenerator(p);
-        if (path && p.src_ip !== p.dst_ip) {
+
+        const pathPacket = g.rep;
+        const path = arcPathGenerator(pathPacket);
+        if (path && pathPacket.src_ip !== pathPacket.dst_ip) {
+            // Lookup bin count using the group's time bucket (g.timestamp) and the source row y position
+            const yPos = findIPPosition(pathPacket.src_ip, pathPacket.src_ip, pathPacket.dst_ip, pairs, ipPositions);
+                const thickness = ARC_STROKE_WIDTH;
             const arc = mainGroup.append("path")
                 .attr("class", "flow-arc")
                 .attr("d", path)
                 .style("stroke", flagColors[ftype] || flagColors.OTHER)
-                .style("opacity", 0.5)
-                .datum(p); // attach packet data for event handlers
+                .style("stroke-width", `${thickness}px`)
+                .style("opacity", 0.12)
+                .datum(g);
 
             // Add interactivity: show packet info on hover
             arc.on('mouseover', (event, d) => {
@@ -1131,8 +1332,20 @@ function drawGroundTruthBoxes(selectedIPs) {
         
         if (sourceY === 0 || destY === 0) return; // Skip if IPs not in current pairs
         
-        const startX = xScale(event.startTimeMicroseconds);
-        const endX = xScale(event.stopTimeMicroseconds);
+        // Handle cases where start and stop times are the same (second-level precision)
+        // If they're identical, expand to cover the full second (microsecond precision)
+        let adjustedStartMicroseconds = event.startTimeMicroseconds;
+        let adjustedStopMicroseconds = event.stopTimeMicroseconds;
+        let wasExpanded = false;
+        if (event.startTimeMicroseconds === event.stopTimeMicroseconds) {
+            // Expand single-second event to a 59s window (start second through +59s) for visibility
+            adjustedStartMicroseconds = Math.floor(event.startTimeMicroseconds / 1_000_000) * 1_000_000;
+            adjustedStopMicroseconds = adjustedStartMicroseconds + 59 * 1_000_000; // +59s
+            wasExpanded = true;
+        }
+        
+        const startX = xScale(adjustedStartMicroseconds);
+        const endX = xScale(adjustedStopMicroseconds);
         const width = Math.max(1, endX - startX); // Ensure minimum width
         const boxHeight = 20; // Fixed height for individual IP boxes
         
@@ -1145,7 +1358,10 @@ function drawGroundTruthBoxes(selectedIPs) {
             width: width,
             height: boxHeight,
             color: eventColors[event.eventType] || '#666',
-            isSource: true
+            isSource: true,
+            adjustedStartMicroseconds,
+            adjustedStopMicroseconds,
+            wasExpanded
         });
         
         // Create box for destination IP
@@ -1157,7 +1373,10 @@ function drawGroundTruthBoxes(selectedIPs) {
             width: width,
             height: boxHeight,
             color: eventColors[event.eventType] || '#666',
-            isSource: false
+            isSource: false,
+            adjustedStartMicroseconds,
+            adjustedStopMicroseconds,
+            wasExpanded
         });
     });
 
@@ -1171,29 +1390,53 @@ function drawGroundTruthBoxes(selectedIPs) {
         .append('rect')
         .attr('class', 'ground-truth-box')
         .attr('fill', d => d.color)
-        .attr('stroke', d => d.color)
-        .on('mouseover', (event, d) => {
-            // Only show tooltip, do NOT change stacking order
-            const tooltip = d3.select('#tooltip');
-            const tooltipContent = `
-                <b>${d.event.eventType}</b><br>
-                IP: ${d.ip} (${d.isSource ? 'Source' : 'Destination'})<br>
-                From: ${d.event.source}<br>
-                To: ${d.event.destination}<br>
-                Start: ${d.event.startTime}<br>
-                Stop: ${d.event.stopTime}<br>
-                Duration: ${Math.round((d.event.stopTimeMicroseconds - d.event.startTimeMicroseconds) / 1000000)}s
-            `;
-            tooltip.style('display', 'block').html(tooltipContent);
-        })
-        .on('mousemove', e => {
-            d3.select('#tooltip')
-                .style('left', `${e.pageX + 40}px`)
-                .style('top', `${e.pageY - 40}px`);
-        })
-        .on('mouseout', () => {
-            d3.select('#tooltip').style('display', 'none');
-        });
+        .attr('stroke', d => d.color);
+
+    // Unified tooltip handlers (apply to both new + existing boxes)
+    function formatAdjStop(adjStop, wasExpanded) {
+        let s = epochMicrosecondsToUTC(adjStop).replace(' UTC','');
+        // Trim millis if present
+        if (s.includes('.')) s = s.split('.')[0];
+        if (wasExpanded) s += ' (+59s)';
+        return s;
+    }
+    function showTooltip(event, d) {
+        const tooltip = d3.select('#tooltip');
+        const adjStop = d.adjustedStopMicroseconds || d.event.stopTimeMicroseconds;
+        const adjStart = d.adjustedStartMicroseconds || d.event.startTimeMicroseconds;
+        const durationSec = Math.round((adjStop - adjStart) / 1_000_000);
+        const startStr = d.event.startTime;
+        const expandedStopStr = formatAdjStop(adjStop, false); // we handle label ourselves
+        let tooltipContent = `
+            <b>${d.event.eventType}</b><br>
+            IP: ${d.ip} (${d.isSource ? 'Source' : 'Destination'})<br>
+            From: ${d.event.source}<br>
+            To: ${d.event.destination}<br>
+            Start: ${startStr}<br>
+        `;
+        if (d.wasExpanded) {
+            // Original stop was same as start; show both
+            tooltipContent += `Original Stop: ${d.event.stopTime}<br>`;
+            tooltipContent += `Estimated Stop (+59s): ${expandedStopStr}<br>`;
+            tooltipContent += `Estimated Duration: ~${durationSec}s`;
+        } else {
+            tooltipContent += `Stop: ${d.event.stopTime}<br>`;
+            tooltipContent += `Duration: ${durationSec}s`;
+        }
+        tooltip.style('display','block').html(tooltipContent);
+    }
+    function moveTooltip(e) {
+        d3.select('#tooltip')
+            .style('left', `${e.pageX + 40}px`)
+            .style('top', `${e.pageY - 40}px`);
+    }
+    function hideTooltip() { d3.select('#tooltip').style('display','none'); }
+
+    // Apply handlers to merged selection
+    groundTruthGroup.selectAll('.ground-truth-box')
+        .on('mouseover', showTooltip)
+        .on('mousemove', moveTooltip)
+        .on('mouseout', hideTooltip);
 
     // Update all boxes (existing and new)
     groundTruthGroup.selectAll('.ground-truth-box')
@@ -1307,8 +1550,7 @@ async function updateIPFilter() {
         // Clear selection to avoid stale selection across different IP filters
         selectedFlowIds.clear();
 
-        // Update flow list and stats based on currentFlows
-        createFlowList(currentFlows);
+        // Update flow stats (flow list will be populated when user clicks on overview chart)
         updateTcpFlowStats(currentFlows);
         
         // Update ground truth statistics
@@ -1321,9 +1563,9 @@ async function updateIPFilter() {
         // Update IP statistics for the current filtered data
         updateIPStats(filteredData);
         // Recompute size scaling once DOM updates complete
-        setTimeout(() => {
-            try { recomputeGlobalMaxBinCountFromVisibleDots(); } catch (_) {}
-        }, 150);
+            setTimeout(() => {
+                try { recomputeGlobalMaxBinCountFromVisibleDots(); } catch (_) {}
+            }, 150);
     } finally {
         // Remove loading indicator
         loadingDiv.remove();
@@ -1362,8 +1604,7 @@ function recomputeGlobalMaxBinCountFromVisibleDots() {
         .attr('r', d => (d && d.binned && d.count > 1) ? scale(d.count) : RADIUS_MIN)
         .attr('data-orig-r', d => (d && d.binned && d.count > 1) ? scale(d.count) : RADIUS_MIN);
     // Keep the size legend in sync with the current scale
-    try { drawSizeLegend(); } catch (_) {}
-    try { drawFlagLegend(); } catch (_) {}
+    try { const axisBaseY = Math.max(20, bottomOverlayHeight - 20); drawSizeLegend(bottomOverlayRoot, width, bottomOverlayHeight, axisBaseY); } catch (_) {}
     try { drawFlagLegend(); } catch (_) {}
 }
         
@@ -1837,12 +2078,57 @@ function formatTimestamp(timestamp) {
 }
 
 function createTooltipHTML(data) {
+    // Helper to decode protocol numbers to names; falls back to TCP for legacy datasets.
+    const PROTOCOL_MAP = {
+        1: 'ICMP',
+        2: 'IGMP',
+        6: 'TCP',
+        17: 'UDP',
+        41: 'IPv6',
+        47: 'GRE',
+        50: 'ESP',
+        51: 'AH',
+        58: 'ICMPv6',
+        89: 'OSPF',
+        132: 'SCTP'
+    };
+    function normalizeProtocolValue(raw) {
+        if (raw === undefined || raw === null || raw === '') return 'TCP';
+        if (Array.isArray(raw)) raw = raw[0];
+        // If already a recognizable string, return upper-cased canonical form
+        if (typeof raw === 'string') {
+            const upper = raw.trim().toUpperCase();
+            // If it's a numeric string try decoding
+            if (/^\d+$/.test(upper)) {
+                const num = parseInt(upper, 10);
+                return PROTOCOL_MAP[num] ? `${PROTOCOL_MAP[num]} (${num})` : `Unknown (${num})`;
+            }
+            // Already a protocol token
+            return upper || 'TCP';
+        }
+        if (typeof raw === 'number') {
+            return PROTOCOL_MAP[raw] ? `${PROTOCOL_MAP[raw]} (${raw})` : `Unknown (${raw})`;
+        }
+        return 'TCP';
+    }
+    function extractProtocol(p) {
+        if (!p) return 'TCP';
+        const raw = p.protocol ?? p.ip_proto ?? p.ipProtocol ?? p.proto ?? p.ipProtocolNumber;
+        return normalizeProtocolValue(raw);
+    }
     if (data.binned && data.count > 1) {
         // Binned data tooltip
         const { utcTime, timestampSec } = formatTimestamp(data.timestamp);
         let tooltipContent = `<b>${data.flagType} (Binned)</b><br>`;
         tooltipContent += `Count: ${data.count} packets<br>`;
         tooltipContent += `From: ${data.src_ip}<br>To: ${data.dst_ip}<br>`;
+        // Aggregate protocols in the bin (in case of mixed, though unlikely)
+        if (data.originalPackets && data.originalPackets.length) {
+            const protocols = Array.from(new Set(data.originalPackets.map(extractProtocol)));
+            tooltipContent += `Protocol: ${protocols.join(', ')}<br>`;
+        } else {
+            tooltipContent += `Protocol: ${extractProtocol(data)}<br>`;
+        }
         tooltipContent += `Time Bin: ${utcTime}<br>`;
         tooltipContent += `Total Bytes: ${formatBytes(data.totalBytes)}`;
         
@@ -1859,7 +2145,7 @@ function createTooltipHTML(data) {
         // Single packet tooltip
         const packet = data.originalPackets ? data.originalPackets[0] : data;
         const { utcTime, timestampSec } = formatTimestamp(packet.timestamp);
-        let tooltipContent = `<b>${classifyFlags(packet.flags)}</b><br>From: ${packet.src_ip}<br>To: ${packet.dst_ip}<br>Time: ${utcTime}`;
+        let tooltipContent = `<b>${classifyFlags(packet.flags)}</b><br>From: ${packet.src_ip}<br>To: ${packet.dst_ip}<br>Protocol: ${extractProtocol(packet)}<br>Time: ${utcTime}`;
         
         // Add sequence and acknowledgment numbers if available
         if (packet.seq_num !== undefined && packet.seq_num !== null) {
@@ -1897,7 +2183,8 @@ function getBinSize(zoomLevel, timeRangeMicroseconds, basePixelSize = 5) {
     // If binning is disabled, return 0 to indicate individual packets
     if (!useBinning) return 0;
     const timeRangeSeconds = Math.max(1, timeRangeMicroseconds / 1000000); // avoid zero
-    const binSeconds = timeRangeSeconds / GLOBAL_BIN_COUNT; // seconds per bin
+    const ARC_BIN_COUNT = (typeof GLOBAL_BIN_COUNT === 'number') ? GLOBAL_BIN_COUNT : (GLOBAL_BIN_COUNT.ARCS || GLOBAL_BIN_COUNT.BAR || 300);
+    const binSeconds = timeRangeSeconds / ARC_BIN_COUNT; // seconds per bin
     const binMicroseconds = Math.max(1, Math.floor(binSeconds * 1000000));
     return binMicroseconds;
 }
@@ -1923,18 +2210,45 @@ function binPackets(packets, xScale, yScale, timeExtent) {
     const binSize = getBinSize(zoomLevel, relevantTimeRange);
     // When a bin would be smaller than ~1 pixel OR density is < ~1 pkt/bin, show individual packets
     const microsPerPixel = Math.max(1, Math.floor(relevantTimeRange / Math.max(1, (typeof width === 'number' ? width : 1))));
-    const estBins = Math.max(1, Math.min(GLOBAL_BIN_COUNT, Math.floor(typeof width === 'number' ? width : GLOBAL_BIN_COUNT)));
+    const ARC_BIN_COUNT2 = (typeof GLOBAL_BIN_COUNT === 'number') ? GLOBAL_BIN_COUNT : (GLOBAL_BIN_COUNT.ARCS || GLOBAL_BIN_COUNT.BAR || 300);
+    const estBins = Math.max(1, Math.min(ARC_BIN_COUNT2, Math.floor(typeof width === 'number' ? width : ARC_BIN_COUNT2)));
     const expectedPktsPerBin = packets.length / estBins;
     const disableBinning = (binSize === 0) || (binSize <= microsPerPixel) || (expectedPktsPerBin < 1.15);
     
-    // Respect user toggle or pixel-threshold: return raw packets (unbinned)
+    // When binning is disabled, still group overlapping packets by position
     if (disableBinning) {
-        return packets.map(d => ({
-            ...d,
-            count: 1,
-            originalPackets: [d],
-            binned: false
-        }));
+        const positionGroups = new Map();
+        
+        packets.forEach(packet => {
+            const timestamp = Math.floor(packet.timestamp);
+            const yPos = findIPPosition(packet.src_ip, packet.src_ip, packet.dst_ip, pairs, ipPositions);
+            const flagType = classifyFlags(packet.flags);
+            
+            // Group by exact timestamp, Y position, and flag type to avoid overlapping
+            const positionKey = `${timestamp}_${yPos}_${flagType}`;
+            
+            if (!positionGroups.has(positionKey)) {
+                positionGroups.set(positionKey, {
+                    timestamp: packet.timestamp,
+                    src_ip: packet.src_ip,
+                    dst_ip: packet.dst_ip,
+                    flags: packet.flags,
+                    flagType: flagType,
+                    yPos: yPos,
+                    count: 0,
+                    originalPackets: [],
+                    binned: false, // Mark as not binned to preserve individual timing
+                    totalBytes: 0
+                });
+            }
+            
+            const group = positionGroups.get(positionKey);
+            group.count++;
+            group.originalPackets.push(packet);
+            group.totalBytes += (packet.length || 0);
+        });
+        
+        return Array.from(positionGroups.values());
     }
     
     // Analyze connection patterns to determine if binning is beneficial
@@ -2004,6 +2318,96 @@ function binPackets(packets, xScale, yScale, timeExtent) {
     });
     
     return binnedData;
+}
+
+// Async CSV parsing with progress tracking
+async function parseCSVAsync(csvText, onProgress) {
+    const lines = csvText.split('\n').filter(line => line.trim().length > 0);
+    if (lines.length < 2) return [];
+    
+    // Parse header line
+    const headerLine = lines[0];
+    const headers = [];
+    let current = '';
+    let inQuotes = false;
+    
+    for (let j = 0; j < headerLine.length; j++) {
+        const char = headerLine[j];
+        if (char === '"') {
+            inQuotes = !inQuotes;
+        } else if (char === ',' && !inQuotes) {
+            headers.push(current.trim());
+            current = '';
+        } else {
+            current += char;
+        }
+    }
+    headers.push(current.trim());
+    
+    const packets = [];
+    const totalLines = lines.length - 1; // Exclude header
+    const BATCH_SIZE = 1000; // Process in batches for progress updates
+    
+    for (let i = 1; i < lines.length; i += BATCH_SIZE) {
+        const endIndex = Math.min(i + BATCH_SIZE, lines.length);
+        
+        for (let lineIndex = i; lineIndex < endIndex; lineIndex++) {
+            const line = lines[lineIndex];
+            if (!line.trim()) continue;
+            
+            const values = [];
+            current = '';
+            inQuotes = false;
+            
+            for (let j = 0; j < line.length; j++) {
+                const char = line[j];
+                if (char === '"') {
+                    inQuotes = !inQuotes;
+                } else if (char === ',' && !inQuotes) {
+                    values.push(current.trim());
+                    current = '';
+                } else {
+                    current += char;
+                }
+            }
+            values.push(current.trim());
+            
+            if (values.length >= headers.length) {
+                const packet = {};
+                for (let k = 0; k < headers.length; k++) {
+                    const header = headers[k].toLowerCase().replace(/[^a-z0-9]/g, '_');
+                    let value = values[k];
+                    
+                    // Type conversion
+                    if (header.includes('time') || header.includes('timestamp')) {
+                        value = parseFloat(value) || 0;
+                    } else if (header.includes('length') || header.includes('size') || header.includes('port') || header.includes('seq') || header.includes('ack')) {
+                        value = parseInt(value) || 0;
+                    }
+                    
+                    packet[header] = value;
+                }
+                
+                if (packet.src_ip && packet.dst_ip && packet.timestamp) {
+                    packets.push(packet);
+                }
+            }
+        }
+        
+        // Update progress
+        if (onProgress) {
+            const progress = (endIndex - 1) / totalLines;
+            onProgress(progress, `Parsing CSV... ${(endIndex - 1).toLocaleString()}/${totalLines.toLocaleString()} lines`);
+        }
+        
+        // Allow UI to update
+        if (i % (BATCH_SIZE * 5) === 0) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+    }
+    
+    LOG(`Parsed ${packets.length} packets from ${lines.length - 1} CSV lines`);
+    return packets;
 }
 
 // CSV parsing helper function
@@ -2093,11 +2497,21 @@ function parseCSV(csvText) {
 function handleFileLoad(event) {
     const file = event.target.files[0];
     if (!file) return;
+    
+    // Show CSV loading progress
+    try { sbShowCsvProgress('Reading CSV file...', 0); } catch (_) {}
+    
     const reader = new FileReader();
-    reader.onload = e => {
+    reader.onload = async e => {
         try {
             const csvText = e.target.result;
-            const packets = parseCSV(csvText);
+            
+            // Update progress for parsing phase
+            try { sbUpdateCsvProgress(0.1, 'Parsing CSV data...'); } catch (_) {}
+            
+            const packets = await parseCSVAsync(csvText, (progress, label) => {
+                try { sbUpdateCsvProgress(0.1 + (progress * 0.4), label); } catch (_) {}
+            });
             
             if (packets && packets.length > 0) {
                 // Packets
@@ -2105,6 +2519,7 @@ function handleFileLoad(event) {
                 filteredData = [];
 
                 // Process TCP flows from the CSV data (reconstruct from individual packet data)
+                try { sbUpdateCsvProgress(0.5, 'Processing TCP flows...'); } catch (_) {}
                 const flowsFromCSV = reconstructFlowsFromCSV(packets);
                 tcpFlows = flowsFromCSV;
                 currentFlows = []; // Initialize as empty - will be populated when IPs are selected
@@ -2113,6 +2528,7 @@ function handleFileLoad(event) {
                 updateTcpFlowStats(currentFlows); // Show initial message about selecting IPs
 
                 // IPs - extract unique IPs from packet data
+                try { sbUpdateCsvProgress(0.9, 'Extracting IP addresses...'); } catch (_) {}
                 const uniqueIPs = Array.from(new Set(fullData.flatMap(p => [p.src_ip, p.dst_ip]))).filter(Boolean);
                 createIPCheckboxes(uniqueIPs);
 
@@ -2126,6 +2542,7 @@ function handleFileLoad(event) {
                 verifyFlowPacketConnection(packets, flowsFromCSV);
                 // Initialize web worker after packets parsed
                 try {
+                    try { sbUpdateCsvProgress(0.95, 'Initializing web worker...'); } catch (_) {}
                     initPacketWorker();
                     // Assign stable index for each packet corresponding to position in filteredData later
                     packets.forEach((p, i) => p._packetIndex = i);
@@ -2136,10 +2553,18 @@ function handleFileLoad(event) {
                 } catch (err) {
                     console.error('Worker init failed', err);
                 }
+                
+                // Complete loading
+                try { sbUpdateCsvProgress(1.0, 'Loading complete!'); } catch (_) {}
+                setTimeout(() => {
+                    try { sbHideCsvProgress(); } catch (_) {}
+                }, 1000);
             } else {
+                try { sbHideCsvProgress(); } catch (_) {}
                 alert('Invalid CSV format: No valid packet data found.');
             }
         } catch (error) { 
+            try { sbHideCsvProgress(); } catch (_) {}
             alert('Error parsing CSV file: ' + error.message); 
         }
     };
@@ -2340,7 +2765,8 @@ function visualizeTimeArcs(packets) {
     } catch {}
     fullDomainBinsCache = { version: dataVersion, data: [], binSize: null, sorted: false };
 
-    const margin = {top: 80, right: 120, bottom: 50, left: 150};
+    // Small top margin to prevent clipping at the window edge
+    const margin = {top: 8, right: 120, bottom: 50, left: 150};
     width = d3.select("#chart-container").node().clientWidth - margin.left - margin.right;
 
     const DOT_RADIUS = 40;
@@ -2374,7 +2800,8 @@ function visualizeTimeArcs(packets) {
 
     const svgContainer = d3.select("#chart").append("svg")
         .attr("width", width + margin.left + margin.right)
-        .attr("height", height + margin.top + margin.bottom);
+        // Add bottomOverlayHeight so IP rows extend under the bottom legends overlay
+        .attr("height", height + margin.top + margin.bottom + bottomOverlayHeight);
 
     svg = svgContainer.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
 
@@ -2392,7 +2819,7 @@ function visualizeTimeArcs(packets) {
     const xAxis = d3.axisBottom(xScale).tickFormat(d => {
         const timestampInt = Math.floor(d);
         const date = new Date(timestampInt / 1000);
-        return date.toISOString().split('T')[1].replace('Z', '');
+        return date.toISOString().split('T')[1].split('.')[0];
     });
 
     let zoomTimeout;
@@ -2415,7 +2842,12 @@ function visualizeTimeArcs(packets) {
         const flowsFilteringActiveImmediate = (showTcpFlows && selectedFlowIds.size > 0 && tcpFlows.length > 0);
         const atFullDomainImmediate = Math.floor(xScale.domain()[0]) <= Math.floor(timeExtent[0]) && Math.floor(xScale.domain()[1]) >= Math.floor(timeExtent[1]);
 
-    svg.select(".x-axis").call(xAxis);
+    // Update bottom overlay axis instead of in-chart axis
+    try {
+        if (bottomOverlayAxisGroup) {
+            bottomOverlayAxisGroup.call(xAxis);
+        }
+    } catch(_) {}
     try { window.__arc_x_domain__ = xScale.domain(); } catch {}
     updateBrushFromZoom();
     try { updateZoomDurationLabel(); } catch(_) {}
@@ -2584,7 +3016,16 @@ function visualizeTimeArcs(packets) {
         }, 32);
     };
 
+    // Configure zoom so regular mouse-wheel scroll passes through to the page.
+    // Require Ctrl/Cmd/Shift for wheel-zoom to avoid interfering with vertical scrolling
     zoom = d3.zoom()
+        .filter((event) => {
+            if (!event) return true;
+            if (event.type === 'wheel') {
+                return event.ctrlKey || event.metaKey || event.shiftKey;
+            }
+            return true; // keep drag/pinch and dblclick zoom enabled
+        })
         .scaleExtent([1, 1e9])
         .on("zoom", zoomed);
 
@@ -2614,23 +3055,43 @@ function visualizeTimeArcs(packets) {
         if (dynamicLayer) dynamicLayer.raise();
     } catch {}
 
-    svg.append("g")
-        .attr("class", "x-axis axis")
-        .attr("transform", `translate(0,${height})`)
-        .call(xAxis);
+    // --- Bottom overlay setup for fixed main axis + legends ---
+    try {
+        chartMarginLeft = margin.left; chartMarginRight = margin.right;
+        bottomOverlaySvg = d3.select('#chart-bottom-overlay-svg');
+        bottomOverlayWidth = Math.max(0, width + chartMarginLeft + chartMarginRight);
+        bottomOverlaySvg
+            .attr('width', bottomOverlayWidth)
+            .attr('height', bottomOverlayHeight);
+        // Root translated by left margin to align with main plot area
+        bottomOverlayRoot = bottomOverlaySvg.select('g.overlay-root');
+        if (bottomOverlayRoot.empty()) {
+            bottomOverlayRoot = bottomOverlaySvg.append('g').attr('class', 'overlay-root');
+        }
+        bottomOverlayRoot.attr('transform', `translate(${chartMarginLeft},0)`);
+        // Axis group anchored near bottom of overlay
+        const axisY = Math.max(20, bottomOverlayHeight - 20);
+        bottomOverlaySvg.select('.main-bottom-axis').remove();
+        bottomOverlayAxisGroup = bottomOverlayRoot.append('g')
+            .attr('class', 'x-axis axis main-bottom-axis')
+            .attr('transform', `translate(0,${axisY})`)
+            .call(xAxis);
+        // Create duration label in overlay, just above axis
+        bottomOverlaySvg.select('.overlay-duration-label').remove();
+        bottomOverlayDurationLabel = bottomOverlayRoot.append('text')
+            .attr('class', 'overlay-duration-label')
+            .attr('x', width / 2)
+            .attr('y', axisY - 12)
+            .attr('text-anchor', 'middle')
+            .style('font-size', '36px')
+            .style('font-weight', '600')
+            .style('fill', '#000')
+            .style('opacity', 0.5)
+            .style('pointer-events', 'none')
+            .text('');
+    } catch (_) {}
 
-    // Big faded label showing the total duration of the current zoomed window
-    const durationLabel = svg.append('text')
-        .attr('class', 'zoom-duration-label')
-        .attr('x', width / 2)
-        .attr('y', height - 12) // place just above the time line
-        .attr('text-anchor', 'middle')
-        .style('font-size', '36px')
-        .style('font-weight', '600')
-        .style('fill', '#000')
-        .style('opacity', 0.12)
-        .style('pointer-events', 'none')
-        .text('');
+    // Duration label is in bottom overlay now
 
     function formatDuration(us) {
         const s = us / 1_000_000;
@@ -2643,13 +3104,13 @@ function visualizeTimeArcs(packets) {
     }
 
     function updateZoomDurationLabel() {
-        if (!durationLabel || !xScale) return;
+        if (!bottomOverlayDurationLabel || !xScale) return;
         try {
             const domain = xScale.domain();
             const durUs = Math.max(0, Math.floor(domain[1]) - Math.floor(domain[0]));
             const label = formatDuration(durUs);
             const center = xScale((domain[0] + domain[1]) / 2);
-            durationLabel.attr('x', center).text(label);
+            bottomOverlayDurationLabel.attr('x', center).text(label);
         } catch (e) { /* ignore */ }
     }
 
@@ -2838,15 +3299,30 @@ function visualizeTimeArcs(packets) {
     if (dynamicLayer) dynamicLayer.style("display", "none");
 
     updateTcpFlowPacketsGlobal();
-    // Draw size legend once initial dots and scales are ready
-    try { drawSizeLegend(); } catch (_) {}
+    // Draw size + flag legends into bottom overlay (fixed position)
+    try { drawSizeLegend(bottomOverlayRoot, width, bottomOverlayHeight); } catch (_) {}
+    try { drawFlagLegend(); } catch (_) {}
 
     const selectedIPs = Array.from(document.querySelectorAll('#ipCheckboxes input[type="checkbox"]:checked'))
         .map(cb => cb.value);
     drawGroundTruthBoxes(selectedIPs);
     drawSelectedFlowArcs();
-    // Sidebar flag stats suppressed; show compact legend in-canvas
+    // Sidebar flag stats suppressed; show compact legend in bottom overlay
     try { drawFlagLegend(); } catch (_) {}
+
+    // Keep overlay sized to current chart width
+    try {
+        bottomOverlayWidth = Math.max(0, width + chartMarginLeft + chartMarginRight);
+        d3.select('#chart-bottom-overlay-svg')
+            .attr('width', bottomOverlayWidth)
+            .attr('height', bottomOverlayHeight);
+        if (bottomOverlayRoot) bottomOverlayRoot.attr('transform', `translate(${chartMarginLeft},0)`);
+        if (bottomOverlayAxisGroup) bottomOverlayAxisGroup.call(d3.axisBottom(xScale).tickFormat(d => {
+            const timestampInt = Math.floor(d);
+            const date = new Date(timestampInt / 1000);
+            return date.toISOString().split('T')[1].split('.')[0];
+        }));
+    } catch(_) {}
 }
 
 function makeConnectionKey(src_ip, src_port, dst_ip, dst_port) {
@@ -2923,3 +3399,84 @@ function exportFlowToCSV(flow) {
         alert('Failed to export CSV. See console for details.');
     }
 }
+
+// Make resize handler available globally for testing and debugging
+window.setupWindowResizeHandler = setupWindowResizeHandler;
+
+// Test function to manually trigger resize (for debugging)
+window.testResize = function() {
+    console.log('Testing manual resize...');
+    const event = new Event('resize');
+    window.dispatchEvent(event);
+};
+
+// Cleanup function to remove event listeners and clear state
+function cleanup() {
+    console.log('Cleaning up arc visualization...');
+    
+    // Clear timeouts and intervals
+    if (typeof resizeTimeout !== 'undefined') {
+        clearTimeout(resizeTimeout);
+    }
+    
+    // Remove event listeners
+    const dataFileInput = document.getElementById('dataFile');
+    if (dataFileInput) {
+        dataFileInput.removeEventListener('change', handleFileLoad);
+    }
+    
+    // Clear chart content
+    const chartContainer = document.getElementById('chart');
+    if (chartContainer) {
+        chartContainer.innerHTML = '';
+    }
+    
+    // Clear overview
+    const overviewContainer = document.getElementById('overview-chart');
+    if (overviewContainer) {
+        overviewContainer.innerHTML = '';
+    }
+    
+    // Clear bottom overlay
+    const bottomOverlay = document.getElementById('chart-bottom-overlay-svg');
+    if (bottomOverlay) {
+        bottomOverlay.innerHTML = '';
+    }
+    
+    // Terminate worker if exists
+    if (packetWorker) {
+        packetWorker.terminate();
+        packetWorker = null;
+        packetWorkerReady = false;
+    }
+    
+    // Reset global state
+    fullData = [];
+    filteredData = [];
+    currentFlows = [];
+    selectedFlowIds.clear();
+    
+    // Clear SVG references
+    svg = null;
+    mainGroup = null;
+}
+
+// Initialize the module
+function init() {
+    console.log('Initializing arc visualization...');
+    
+    // Add file input listener
+    const dataFileInput = document.getElementById('dataFile');
+    if (dataFileInput) {
+        dataFileInput.addEventListener('change', handleFileLoad);
+    }
+    
+    // Initialize the visualization
+    initializeArcVisualization();
+    
+    // Load ground truth data in the background
+    loadGroundTruthData();
+}
+
+// Export functions for dynamic loading
+export { init, cleanup };
