@@ -19,6 +19,16 @@ This document outlines the plan to integrate the Attack TimeArcs visualization w
 2. **No attack labels in streaming data**: The 60GB file lacks attack type information
 3. **Scale mismatch**: Cannot load 60GB into browser memory
 4. **Timestamp formats differ**: Attack data uses minutes, streaming data uses microseconds
+5. **Multi-day support gap**: Attack TimeArcs supports multiple files, streaming loader does not
+
+### Multi-File Support Status
+
+| System | Multi-File Support | Implementation |
+|--------|-------------------|----------------|
+| attack_timearcs.js | ✅ Yes | Iterates files, combines into `combinedData` array |
+| tcp_data_loader_streaming.py | ❌ No | Single `--data` argument only |
+
+This gap must be addressed for multi-day analysis scenarios.
 
 ### Timestamp Correlation (Verified)
 
@@ -121,11 +131,17 @@ Difference: 0.40 minutes ✓ (same time period)
 
 ### Phase 1: Modify `tcp_data_loader_streaming.py`
 
-**Estimated changes: ~50 lines**
+**Estimated changes: ~100 lines** (increased due to multi-file support)
 
 #### New Command-Line Arguments
 
 ```python
+# Change --data to accept multiple files (like attack_extract.py)
+parser.add_argument('--data',
+    nargs='+',  # Accept one or more files
+    required=True,
+    help='Input TCP data file(s) (CSV or CSV.GZ) - can specify multiple files for multi-day analysis')
+
 parser.add_argument('--filter-ips', type=str,
     help='Comma-separated list of IP IDs to filter (e.g., "1,2,7204")')
 
@@ -137,6 +153,42 @@ parser.add_argument('--filter-time-end', type=int,
 
 parser.add_argument('--attack-context', type=str,
     help='Attack type label for this subset (stored in manifest)')
+```
+
+#### Multi-File Processing Logic
+
+```python
+def process_tcp_data_chunked(data_files, ip_map_file, output_dir, ...):
+    """
+    Process multiple TCP data files sequentially.
+
+    Args:
+        data_files: List of input CSV file paths (can be single file or multiple)
+        ...
+    """
+    # data_files is now a list (even if single file)
+    if isinstance(data_files, str):
+        data_files = [data_files]
+
+    print(f"Processing {len(data_files)} input file(s)...")
+
+    # Process each file sequentially
+    for file_index, data_file in enumerate(data_files, start=1):
+        print(f"\n[{file_index}/{len(data_files)}] Processing: {data_file}")
+
+        if not Path(data_file).exists():
+            print(f"  WARNING: File not found, skipping: {data_file}")
+            continue
+
+        compression = 'gzip' if data_file.endswith('.gz') else None
+        csv_iterator = pd.read_csv(data_file, chunksize=chunk_read_size,
+                                    compression=compression)
+
+        for df_chunk in csv_iterator:
+            # ... existing chunk processing with filtering ...
+
+    # Finalize flows from all files combined
+    # (connection_map persists across files for cross-file flows)
 ```
 
 #### Filtering Logic (in chunk processing loop)
@@ -176,6 +228,26 @@ def process_tcp_data_chunked(..., filter_ips=None, filter_time_start=None,
         # ... rest of existing processing ...
 ```
 
+#### Cross-File Flow Handling
+
+When processing multiple files, TCP flows may span across file boundaries:
+
+```python
+# connection_map persists across files
+# This allows flows that start in day1.csv to continue in day2.csv
+
+connection_map = {}  # Initialized once, shared across all files
+
+for data_file in data_files:
+    for df_chunk in pd.read_csv(data_file, chunksize=...):
+        # Incremental flow detection uses shared connection_map
+        completed_flows, flow_counter, timed_out = detect_tcp_flows_incremental(
+            tcp_chunk,
+            connection_map,  # Shared across files!
+            ...
+        )
+```
+
 #### Manifest Enhancement
 
 ```python
@@ -184,6 +256,9 @@ manifest = {
     'version': '2.0',
     'format': 'chunked',
     # ... existing fields ...
+
+    # NEW: Source files (supports multiple)
+    'source_files': data_files,  # List of all input files processed
 
     # NEW: Attack context from selection
     'attack_context': {
@@ -411,12 +486,12 @@ import { FolderLoader } from './folder_loader.js';
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Example Session
+### Example Session (Single File)
 
 ```bash
 # User selects arcs showing DDoS attack between IPs 1,2 at minutes 20954244-20954250
 
-# Generated command:
+# Generated command (single day):
 python tcp_data_loader_streaming.py \
   --data /mnt/data/decoded_set1_full.csv \
   --ip-map combined_pcap_data_set5_compressed_ip_map.json \
@@ -428,12 +503,12 @@ python tcp_data_loader_streaming.py \
 
 # Output:
 # Loading IP mapping from combined_pcap_data_set5_compressed_ip_map.json...
-# Processing TCP data from /mnt/data/decoded_set1_full.csv...
+# Processing 1 input file(s)...
+# [1/1] Processing: /mnt/data/decoded_set1_full.csv
 # Chunk 1: skipped (no matching packets)
 # Chunk 2: skipped (no matching packets)
 # ...
 # Chunk 47: processed 12,345 packets, 11,234 TCP, 156 active flows...
-# Chunk 48: processed 8,901 packets, 8,234 TCP, 89 active flows...
 # ...
 # Successfully processed data:
 #   - Total packets: 45,678
@@ -441,6 +516,51 @@ python tcp_data_loader_streaming.py \
 #   - Unique IPs: 2
 #   - Total flows: 234
 #   - Output directory: subset_ddos_1702345678/
+```
+
+### Example Session (Multiple Days)
+
+```bash
+# User loads multiple days in attack_timearcs, selects arcs spanning day 1 and day 2
+
+# Generated command (multi-day):
+python tcp_data_loader_streaming.py \
+  --data /mnt/data/decoded_set1_day1.csv \
+        /mnt/data/decoded_set1_day2.csv \
+        /mnt/data/decoded_set1_day3.csv \
+  --ip-map combined_pcap_data_set5_compressed_ip_map.json \
+  --output-dir subset_multiday_ddos/ \
+  --filter-ips 1,2,15,42 \
+  --filter-time-start 1257254640000000 \
+  --filter-time-end 1257427440000000 \
+  --attack-context "ddos"
+
+# Output:
+# Loading IP mapping from combined_pcap_data_set5_compressed_ip_map.json...
+# Processing 3 input file(s)...
+#
+# [1/3] Processing: /mnt/data/decoded_set1_day1.csv
+# Chunk 1: skipped (no matching packets)
+# ...
+# Chunk 47: processed 12,345 packets, 11,234 TCP, 156 active flows...
+#   File complete: 45,678 matched rows
+#
+# [2/3] Processing: /mnt/data/decoded_set1_day2.csv
+# Chunk 1: processed 8,901 packets, 8,234 TCP, 89 active flows...
+# ...
+#   File complete: 38,901 matched rows
+#
+# [3/3] Processing: /mnt/data/decoded_set1_day3.csv
+# ...
+#   File complete: 12,456 matched rows
+#
+# Successfully processed data:
+#   - Source files: 3
+#   - Total packets: 97,035
+#   - TCP packets: 89,234
+#   - Unique IPs: 4
+#   - Total flows: 567 (including 23 cross-file flows)
+#   - Output directory: subset_multiday_ddos/
 ```
 
 ## Technical Details
@@ -498,23 +618,48 @@ This is valid because:
 
 | File | Changes | Lines |
 |------|---------|-------|
-| `tcp_data_loader_streaming.py` | Add filter args + logic | ~50 |
+| `tcp_data_loader_streaming.py` | Add multi-file support + filter args + logic | ~100 |
 
 ### Files to Create
 
 | File | Purpose | Lines |
 |------|---------|-------|
 | `unified_timearcs.html` | Combined UI layout | ~200 |
-| `unified_timearcs.js` | Selection + command generation | ~400 |
+| `unified_timearcs.js` | Selection + command generation (multi-file aware) | ~450 |
 
 ### Existing Files Used (No Changes)
 
 | File | Purpose |
 |------|---------|
-| `attack_timearcs.js` | Attack arc rendering |
+| `attack_timearcs.js` | Attack arc rendering (already supports multi-file) |
 | `ip_bar_diagram.js` | TCP flow rendering |
 | `folder_loader.js` | Folder-based data loading |
 | `folder_integration.js` | UI integration for folder loader |
+
+### Multi-File Considerations
+
+The unified UI must track which source files were loaded in attack_timearcs to generate the correct `--data` arguments:
+
+```javascript
+// Track loaded attack data files
+let loadedAttackFiles = [];
+
+fileInput.addEventListener('change', (e) => {
+    loadedAttackFiles = Array.from(e.target.files).map(f => f.name);
+});
+
+// When generating command, include all corresponding streaming data files
+function generateCommand(selection) {
+    // Map attack CSV names to streaming data file paths
+    // e.g., "day1_attacks.csv" → "/path/to/decoded_day1.csv"
+    const streamingFiles = loadedAttackFiles.map(f => mapToStreamingFile(f));
+
+    return `python tcp_data_loader_streaming.py \\
+  --data ${streamingFiles.join(' \\\n        ')} \\
+  --filter-ips ${selection.ips.join(',')} \\
+  ...`;
+}
+```
 
 ## Future Enhancements (Optional)
 
