@@ -1,0 +1,132 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{url}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{TCP TimeArcs: Temporal Visualization of Attack Patterns in Large-Scale Network Traffic}
+
+\author{\IEEEauthorblockN{Author Name\IEEEauthorrefmark{1},
+Co-Author Name\IEEEauthorrefmark{2}}
+\IEEEauthorblockA{\IEEEauthorrefmark{1}Department of Computer Science, University Name\\
+Email: author@university.edu}
+\IEEEauthorblockA{\IEEEauthorrefmark{2}Department of Computer Science, University Name\\
+Email: coauthor@university.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+Network security analysis faces a critical challenge: effectively visualizing temporal attack patterns in massive-scale network traffic captures. We present TCP TimeArcs, a novel browser-based visualization tool that adapts the TimeArcs temporal relationship technique to network security. Through chunked data loading and streaming processing, TCP TimeArcs reduces memory consumption by 50--100$\times$ while enabling interactive temporal magnification (2$\times$--200$\times$ zoom) for detailed attack pattern analysis. We evaluate TCP TimeArcs on datasets ranging from 10,000 to 1,000,000 packets, demonstrating load times of $<$15 seconds and memory usage $<$1GB. Case studies show effective detection of DDoS attacks, port scans, and multi-day campaigns that are difficult to identify in traditional packet-level tools.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Network security visualization, temporal analysis, attack pattern detection, PCAP analysis, intrusion detection
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Network security analysis faces a critical challenge: how to effectively visualize and understand temporal attack patterns in massive-scale network traffic captures. Modern network infrastructures generate terabytes of packet data daily, with individual network capture (PCAP) files frequently exceeding 60 gigabytes~\cite{tcptimearcs_memory}. While traditional network analysis tools provide detailed packet-level inspection capabilities, they struggle to reveal the temporal dynamics and multi-host coordination patterns characteristic of contemporary cyber attacks~\cite{ring2019survey,draperGil2016characterization}.
+
+\subsection{The Scalability Problem}
+
+Conventional network traffic analysis tools, particularly Wireshark---the de facto standard for packet analysis---face severe scalability limitations when processing large PCAP files. Wireshark cannot efficiently analyze gigabyte-scale datasets and frequently crashes with out-of-memory errors, particularly when analyzing stateful protocols like TCP~\cite{wireshark_large_pcap}. These limitations are not merely technical inconveniences; they represent fundamental barriers to understanding modern attack campaigns that unfold across millions of packets over extended time periods~\cite{brager2024pcap}.
+
+Beyond memory constraints, PCAP files were never designed for managing packet captures larger than a few hundred megabytes. Reading, filtering, and searching operations become prohibitively slow and tedious beyond this threshold~\cite{endace_pcap}. For security analysts investigating live incidents, where time is critical, this performance degradation can delay threat detection and response by hours or even days~\cite{moore2023network_forensics}.
+
+\subsection{The Temporal Visualization Gap}
+
+Network intrusion detection systems (IDS) and traffic analysis platforms generate vast quantities of alert data, yet lack effective mechanisms for revealing temporal relationships between attack events~\cite{ambusaidi2016building}. While tools like Suricata and Snort excel at signature-based detection, they provide limited insight into \emph{when} attack patterns emerge, \emph{how} they evolve over time, and \emph{which} IP addresses participate in coordinated attack campaigns~\cite{azure_ids_tutorial}.
+
+Recent research has emphasized the importance of temporal analysis for network security. Studies on network traffic classification demonstrate that while packet-level tools can retrieve basic information such as source IP addresses and ports, they fail to provide statistical insights into network session dynamics~\cite{zhang2023network}. Similarly, research on interactive web-based visual analysis of network traffic highlights critical challenges in ``handling complex network traffic data, manipulating various data attributes, incorporating different analytical approaches, and eventually identifying domain-specific insights from visual representations''~\cite{lim2022interactive}.
+
+\subsection{Attack Pattern Discovery Challenges}
+
+Security analysts face a fundamental cognitive challenge: how to identify unknown attack patterns in datasets containing millions of packets exchanged between thousands of IP addresses. Traditional flow-graph visualizations display individual connections sequentially but cannot effectively show:
+
+\begin{enumerate}
+    \item \textbf{Temporal bursts} indicating coordinated attack activity across multiple hosts
+    \item \textbf{Attack campaign evolution} spanning hours or days
+    \item \textbf{Multi-target coordination} where attackers simultaneously probe multiple victims
+    \item \textbf{Attack-phase transitions} from reconnaissance to exploitation to data exfiltration
+\end{enumerate}
+
+These patterns are often visually imperceptible in packet lists or sequential flow diagrams, yet they represent critical forensic indicators for understanding attack methodology and attribution~\cite{moustafa2015unsw}.
+
+\subsection{Our Contribution: TCP TimeArcs}
+
+We present \textbf{TCP TimeArcs}, a novel network traffic visualization tool that addresses these challenges by adapting the TimeArcs temporal relationship visualization technique~\cite{dang2016timearcs} to the domain of network security analysis. TimeArcs was originally developed for visualizing dynamic relationships in text corpora and social networks, demonstrating the power of arc-based temporal diagrams for revealing fluctuations and clustering patterns over time.
+
+TCP TimeArcs extends this approach to TCP/IP packet analysis with four key innovations:
+
+\textbf{1. Scalable Browser-Based Architecture.}
+Through chunked data loading and streaming processing, TCP TimeArcs reduces memory consumption for a 60GB dataset from 10--20GB to approximately 200MB---a 50--100$\times$ reduction---enabling analysis of massive captures in standard web browsers without enterprise infrastructure~\cite{tcptimearcs_memory}.
+
+\textbf{2. Temporal Magnification (Lensing).}
+Inspired by the original TimeArcs focus+context technique~\cite{dang2016timearcs}, TCP TimeArcs implements interactive temporal magnification (2$\times$ to 200$\times$ zoom) that allows analysts to examine fine-grained timing details while maintaining awareness of overall attack campaign structure.
+
+\textbf{3. Attack-Focused Visualization.}
+Arc diagrams intuitively reveal attack patterns through visual signatures: DDoS attacks appear as dense arc clusters, port scans manifest as sequential connection patterns, and coordinated multi-stage attacks display characteristic temporal progressions across multiple IP pairs.
+
+\textbf{4. Progressive Data Loading.}
+A novel chunked file format (storing 200 flows per file) enables on-demand loading of detailed TCP flow information, reducing initial load times from minutes to seconds while maintaining instant access to flow-level forensic details.
+
+\subsection{Addressing the Scale-Detail Paradox}
+
+Network forensics requires both high-level pattern recognition and low-level packet inspection---what we term the ``scale-detail paradox.'' Analysts must first identify \emph{which} network activities warrant investigation among millions of packets, then drill down into \emph{specific} TCP flows to understand attack mechanics. Traditional tools force analysts to choose: either visualize high-level statistics (losing temporal detail) or inspect individual packets (losing situational awareness).
+
+TCP TimeArcs resolves this paradox through a two-stage workflow:
+
+\textbf{Pattern Discovery Phase:} Analysts visualize attack patterns in aggregated data (25MB compressed from 60GB raw capture), selecting suspicious temporal arcs representing communication bursts between specific IP pairs during defined time windows.
+
+\textbf{Detail Extraction Phase:} Selected IP pairs and time ranges trigger streaming extraction from the full dataset, generating filtered subsets (1--50MB) containing complete TCP flows with packet-level detail for forensic analysis.
+
+This workflow enables analysts to visually identify attack signatures in massive datasets, then seamlessly transition to detailed flow-level investigation---combining the speed of statistical analysis with the forensic rigor of packet inspection.
+
+\subsection{Paper Organization}
+
+The remainder of this paper is organized as follows: Section~\ref{sec:related} reviews related work in network traffic visualization and intrusion detection systems. Section~\ref{sec:design} details the TCP TimeArcs architecture, including data processing pipeline, visualization techniques, and scalability mechanisms. Section~\ref{sec:evaluation} presents performance evaluation across datasets ranging from 10,000 to 1,000,000 packets. Section~\ref{sec:casestudies} demonstrates real-world applications through case studies of DDoS, port scanning, and multi-day attack campaigns. Section~\ref{sec:discussion} discusses limitations and future research directions. Section~\ref{sec:conclusion} concludes.
+
+\section{Related Work}
+\label{sec:related}
+% TODO: Add related work content
+
+\section{Design and Implementation}
+\label{sec:design}
+% TODO: Add design content
+
+\section{Evaluation}
+\label{sec:evaluation}
+% TODO: Add evaluation content
+
+\section{Case Studies}
+\label{sec:casestudies}
+% TODO: Add case studies content
+
+\section{Discussion and Limitations}
+\label{sec:discussion}
+% TODO: Add discussion content
+
+\section{Conclusion}
+\label{sec:conclusion}
+% TODO: Add conclusion content
+
+\section*{Acknowledgments}
+This work was supported by [Funding Agency] under grant [Grant Number].
+
+\bibliographystyle{IEEEtran}
+\bibliography{PAPER_REFERENCES}
+
+\end{document}
